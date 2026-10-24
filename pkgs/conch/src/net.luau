@@ -33,14 +33,14 @@ export type InvokeCommandPacket = {
 	name: string,
 	invoke_id: number,
 
-	args: { unknown },
+	args: { { unknown } },
 }
 
 export type InvokeReplyPacket =
 	{
 		status: "ok",
 		invoke_id: number,
-		results: { unknown },
+		results: { { unknown } },
 	}
 	| {
 		status: "err",
@@ -238,7 +238,7 @@ end
 function net.client.invoke_command(
 	invoke_id: number,
 	name: string,
-	args: { unknown }
+	args: { { unknown } }
 )
 	assert(net.client.initialized, "client not initialized")
 	assert_run_context "client"
@@ -297,6 +297,16 @@ function net.server.fire_unregister_command(info: UnregisterCommandPacket)
 	remotes.unregister_command:FireAllClients(info)
 end
 
+function net.server.fire_unregister_command_to(
+	player: Player,
+	info: UnregisterCommandPacket
+)
+	assert(net.server.initialized, "server not initialized")
+	assert_run_context "server"
+
+	remotes.unregister_command:FireClient(player, info)
+end
+
 function net.server.on_command_invoke(callback: (
 	player: Player,
 	command_invoke: InvokeCommandPacket
@@ -310,7 +320,7 @@ end
 function net.server.fire_successful_invoke_reply(
 	player: Player,
 	invoke_id: number,
-	results: { unknown }
+	results: { { unknown } }
 )
 	assert(net.server.initialized, "server not initialized")
 	assert_run_context "server"
@@ -321,7 +331,21 @@ function net.server.fire_successful_invoke_reply(
 		results = results,
 	}
 
-	remotes.invoke_server_command:FireClient(player, invoke_reply_packet)
+	-- the client waits for a reply, so one has to go out even if this throws
+	local ok, err = pcall(
+		remotes.invoke_server_command.FireClient,
+		remotes.invoke_server_command,
+		player,
+		invoke_reply_packet
+	)
+	if not ok then
+		warn(err)
+		net.server.fire_failed_invoke_reply(
+			player,
+			invoke_id,
+			"the command ran, but its results couldn't be sent"
+		)
+	end
 end
 
 function net.server.fire_failed_invoke_reply(

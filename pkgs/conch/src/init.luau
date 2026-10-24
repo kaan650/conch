@@ -32,9 +32,11 @@ local limits: types.Limits = {}
 
 -- keyed by user, so the entries go away together with the user
 local invoke_buckets: { [types.User]: { tokens: number, at: number } } = {}
-local last_runs: { [types.User]: { [string]: number } } = {}
 setmetatable(invoke_buckets, { __mode = "k" })
-setmetatable(last_runs, { __mode = "k" })
+
+-- players that left, so a late get_user doesn't store a user for them again
+local departed: { [Player]: true } = {}
+setmetatable(departed, { __mode = "k" })
 
 --[=[
 Takes one invoke from the user's token bucket, which refills at
@@ -57,28 +59,6 @@ local function take_invoke(user: types.User): boolean
 	return true
 end
 
---[=[
-Returns how many seconds are left on the command's cooldown for the user.
-When none are left, the cooldown starts again.
-]=]
-local function use_cooldown(
-	user: types.User,
-	command: types.CommandRepresentation
-): number
-	local cooldown = command.cooldown
-	if not cooldown then return 0 end
-
-	local runs: { [string]: number } = last_runs[user] or {}
-	last_runs[user] = runs
-
-	local now = os.clock()
-	local last = runs[command.name]
-	if last and now - last < cooldown then return cooldown - (now - last) end
-
-	runs[command.name] = now
-	return 0
-end
-
 local function FOREACH<K, V>(t: { [K]: V }, fn: (value: V, key: K) -> ())
 	for key, value in t do
 		fn(value, key)
@@ -86,27 +66,16 @@ local function FOREACH<K, V>(t: { [K]: V }, fn: (value: V, key: K) -> ())
 end
 
 local function set_role(role: types.Role, ...: types.Permission)
+	-- users with the role get the commands it now allows on the next resend
+	for _, user in state.users do
+		if table.find(user.roles, role) then user.dirty = true end
+	end
+
 	state.roles[role] = { ... }
 
-	if IS_SERVER then net.server.fire_update_role_perms(role, { ... }) end
-end
-
-local function initiate_user_replication(user: types.User)
-	if not user.player then return end
-
-	for _, command in console.console.commands do
-		if not has_permissions(user, unpack(command.permissions)) then
-			continue
-		end
-
-		net.server.fire_register_command(user.player, {
-			name = command.name,
-			description = command.description,
-			permissions = command.permissions,
-			aliases = command.aliases,
-			group = command.group,
-			type = command.type,
-		})
+	-- before initiate_default_lifecycle, on_ready sends every role instead
+	if IS_SERVER and net.server.initialized then
+		net.server.fire_update_role_perms(role, { ... })
 	end
 end
 
@@ -116,19 +85,30 @@ local function get_user(key: Player | string)
 		local self = state.users[user_key]
 
 		return if not self
-			then create_user { name = user_key, player = false }
+			then create_user { name = key, player = false }
 			else self
 	else
 		local user_key = user.obtain_user_key(key, key.DisplayName)
 		local self = state.users[user_key]
 
-		if not self then
-			local user = create_user { name = key.DisplayName, player = key }
-			initiate_user_replication(user)
-			return user
-		else
-			return self
+		if self and self.player == key then return self end
+
+		if departed[key] then
+			return {
+				id = user_key,
+				name = key.DisplayName,
+				player = key,
+
+				disconnected = true,
+				dirty = false,
+				roles = {},
+			}
 		end
+
+		-- left over from an earlier Player with the same UserId
+		if self then disconnect_user(self) end
+
+		return create_user { name = key.DisplayName, player = key }
 	end
 end
 
@@ -143,6 +123,12 @@ local function invoke_server_command(
 		or typeof(data.args) ~= "table"
 	then
 		return player:Kick()
+	end
+
+	local args = {}
+	for i, arg in data.args do
+		if typeof(arg) ~= "table" then return player:Kick() end
+		args[i] = arg[1]
 	end
 
 	local user = get_user(player)
@@ -160,7 +146,7 @@ local function invoke_server_command(
 		return fail "you are running commands too quickly"
 	end
 
-	local remaining = use_cooldown(user, command)
+	local remaining = console.get_cooldown(user, command.name, command.cooldown)
 	if remaining > 0 then
 		return fail(`{command.name} is on cooldown for {math.ceil(remaining)}s`)
 	end
@@ -182,28 +168,49 @@ local function invoke_server_command(
 			)
 		end
 
+		local results = {}
+		for i = 1, select("#", ...) do
+			results[i] = { (select(i, ...)) }
+		end
+
 		return net.server.fire_successful_invoke_reply(
 			player,
 			data.invoke_id,
-			{ ... }
+			results
 		)
 	end
 
-	return handle(pcall(command.callback, unpack(data.args)))
+	return handle(pcall(command.callback, unpack(args, 1, #data.args)))
 end
+
+local already_ready = {}
+
+-- the registration each user's client last got, so a role change only sends
+-- the commands it newly allows
+local sent_commands: { [types.User]: { [string]: types.CommandRepresentation } } =
+	{}
+setmetatable(sent_commands, { __mode = "k" })
 
 local function resend_new_commands(user: types.User)
 	if not user.dirty then return end
 	if not user.player then return end
+	-- on_ready sends them all once the client is listening
+	if not already_ready[user.player] then return end
 
-	for _, cmd in console.console.commands do
+	local sent = sent_commands[user] or {}
+	sent_commands[user] = sent
+
+	for name, cmd in console.console.commands do
+		if sent[name] == cmd then continue end
+		if not has_permissions(user, unpack(cmd.permissions)) then continue end
+
 		console.replicate_to_player(user.player, cmd)
+		sent[name] = cmd
 	end
 
 	user.dirty = false
 end
 
-local already_ready = {}
 local function on_ready(player: Player)
 	if already_ready[player] then return end
 
@@ -226,11 +233,13 @@ local function on_ready(player: Player)
 end
 
 local function disconnect_user_for_player(player: Player)
+	departed[player] = true
+	already_ready[player] = nil
+
 	local key = user.obtain_user_key(player, player.DisplayName)
 	local self = state.users[key]
 
-	if not self then return end
-	already_ready[player] = nil
+	if not self or self.player ~= player then return end
 
 	disconnect_user(self)
 end

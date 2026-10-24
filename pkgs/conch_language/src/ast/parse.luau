@@ -1,4 +1,5 @@
 local ast = require "./ast"
+local to_number = require "./number"
 
 local function char(c: string): number return string.byte(c) :: number end
 
@@ -52,7 +53,7 @@ export type Output = { issues: { Issue }, result: ast.Ast? }
 
 local function parse(input: buffer): Output
 	local pos = 0
-	local line = 0
+	local line = 1
 	local len = buffer.len(input)
 	local issues: { Issue } = {}
 
@@ -87,20 +88,6 @@ local function parse(input: buffer): Output
 			result = nil,
 			issues = issues,
 		}
-	end
-
-	local function eof(msg: string)
-		if pos >= len then
-			table.insert(
-				issues,
-				{ why = msg, span = vector.create(pos, pos, line) }
-			)
-			error({
-				result = nil,
-				issues = issues,
-			}, 0)
-		end
-		return false
 	end
 
 	local function bump_peek()
@@ -148,10 +135,16 @@ local function parse(input: buffer): Output
 		local delim = peek()
 		local c = bump_peek()
 
-		while
-			c ~= delim and not eof("expected string to be finished at", pos)
-		do
-			if c == 0 or c == char "\n" or c == char "\r" then
+		while c ~= delim do
+			if pos >= len then
+				-- still a string so the rest of the input can be analyzed while
+				-- the string is being typed
+				table.insert(issues, {
+					why = "expected string to be finished at",
+					span = vector.create(pos, pos, line),
+				})
+				return "string"
+			elseif c == 0 or c == char "\n" or c == char "\r" then
 				return "error"
 			elseif c == char "\\" then
 				bump()
@@ -169,7 +162,6 @@ local function parse(input: buffer): Output
 
 	local function number(): "number" | "error"
 		local start = pos
-		local base = 10
 
 		local c: number = peek()
 
@@ -178,10 +170,8 @@ local function parse(input: buffer): Output
 
 			if c == char "x" or c == char "X" then
 				c = bump_peek()
-				base = 16
 			elseif c == char "b" or c == char "B" then
 				c = bump_peek()
-				base = 2
 			end
 		end
 
@@ -199,17 +189,7 @@ local function parse(input: buffer): Output
 			c = bump_peek()
 		end
 
-		local text: string
-		if base == 10 then
-			text = buffer.readstring(input, start, pos - start) :: string
-		else
-			text =
-				buffer.readstring(input, start + 2, pos - start - 2) :: string
-		end
-
-		text = string.gsub(text, "_", "")
-
-		if tonumber(text, base) then
+		if to_number(buffer.readstring(input, start, pos - start)) then
 			return "number"
 		else
 			return "error"
@@ -326,7 +306,7 @@ local function parse(input: buffer): Output
 			bump()
 			return "|"
 		elseif c == char "\n" then
-			bump()
+			bump_any()
 			return "\n"
 		elseif c == char ";" then
 			bump()
@@ -468,7 +448,8 @@ local function parse(input: buffer): Output
 		local kind = token.kind
 
 		if kind == "identifier" or kind == "number" or kind == "string" then
-			return token.text
+			-- expect_fatal passes a bare kind, which has no text
+			return token.text or kind
 		elseif token.kind == "error" then
 			return "error '" .. token.text .. "'"
 		else
@@ -548,19 +529,27 @@ local function parse(input: buffer): Output
 
 	local function separated<T>(
 		fn: () -> T,
-		delimiter: ast.TokenKindRest?
+		delimiter: ast.TokenKindRest?,
+		ends_at_newline: boolean?
 	): ast.Separated<T>
 		local values = {}
 
+		-- is_delimiter skips newlines, so they're checked before it
 		while
-			not is_delimiter() and not (delimiter and current_is(delimiter))
+			not (ends_at_newline and current_kind == "\n")
+			and not is_delimiter()
+			and not (delimiter and current_is(delimiter))
 		do
 			skip_current()
 
 			local current_column = current_pos
 			local current_line = line
 			local value = fn()
-			local separator = if current_is "," then expect "," else nil
+			local separator = if ends_at_newline
+					and current_kind == "\n"
+				then nil
+				elseif current_is "," then expect ","
+				else nil
 
 			table.insert(values, {
 				value = value,
@@ -571,6 +560,9 @@ local function parse(input: buffer): Output
 					current_line
 				),
 			})
+
+			-- a comma carries the list over to the next line
+			if ends_at_newline and separator then skip_current() end
 		end
 
 		return values
@@ -610,9 +602,15 @@ local function parse(input: buffer): Output
 			end
 		end
 
+		local last_statement = parse_last_statement()
+
+		while current_kind == ";" do
+			consume()
+		end
+
 		return {
 			body = body,
-			last_statement = parse_last_statement(),
+			last_statement = last_statement,
 			span = vector.create(start, current_pos),
 		}
 	end
@@ -648,7 +646,7 @@ local function parse(input: buffer): Output
 			}
 		elseif current_is "return" then
 			local token = expect_fatal "return"
-			local values = separated(parse_expression_command)
+			local values = separated(parse_expression_command, nil, true)
 
 			local node: ast.Return = {
 				kind = "return" :: "return",
@@ -896,7 +894,12 @@ local function parse(input: buffer): Output
 		local function parse_tablefield_namekey(): ast.TableFieldNameKey
 			local name = expect_fatal "identifier"
 			local equals = expect_fatal "="
-			local value = parse_expression_command()
+			-- a missing value is an issue instead of a panic, so the value
+			-- can still be completed while it's being typed
+			local value = if is_delimiter() or current_is ","
+				then nil
+				else parse_expression_command()
+			if not value then throw("expected expression", equals.span) end
 
 			return {
 				kind = "name_key",
@@ -937,7 +940,9 @@ local function parse(input: buffer): Output
 					),
 				}
 			else -- nokey vector
-				local first_separator = expect_fatal ","
+				local first_separator = if current_is ","
+					then expect_fatal ","
+					else nil
 				local values: ast.Separated<ast.Expression | ast.ExpressionCommand?> =
 					{
 						{
@@ -945,24 +950,30 @@ local function parse(input: buffer): Output
 							separator = first_separator,
 							span = to_span(
 								value and value.span,
-								first_separator.span
+								first_separator and first_separator.span
 							),
 						},
 					}
 
-				while not is_delimiter() do
+				while first_separator and not is_delimiter() do
 					skip_current()
 
 					local start = current_pos
 					local expression = parse_expression_command()
-					if not current_is "," then break end
-					local separator = expect_fatal ","
+					local separator = if current_is ","
+						then expect_fatal ","
+						else nil
 
 					table.insert(values, {
 						value = expression,
 						separator = separator,
-						span = vector.create(start, separator.span.y),
+						span = vector.create(
+							start,
+							separator and separator.span.y or start
+						),
 					})
+
+					if not separator then break end
 				end
 
 				local right = expect "]"
@@ -1019,7 +1030,11 @@ local function parse(input: buffer): Output
 					values.value
 						and values.value[#values.value]
 						and values.value[#values.value].span,
-					values.right and values.right.span
+					values.right and values.right.span,
+					-- an unfinished table runs to the end of the input
+					if not values.right and current_kind == "eof"
+						then current_token.span
+						else nil
 				),
 			}
 		end
@@ -1230,7 +1245,7 @@ local function parse(input: buffer): Output
 				local left_priority, right_priority =
 					binary_operator_priority(binop)
 
-				if left_priority < limit then break end
+				if left_priority <= limit then break end
 
 				consume()
 
@@ -1244,7 +1259,8 @@ local function parse(input: buffer): Output
 					right = rhs,
 					span = to_span(
 						expr and expr.span or nil,
-						binop and binop.span or nil
+						binop and binop.span or nil,
+						rhs and rhs.span or nil
 					),
 				}
 			end
@@ -1396,6 +1412,9 @@ local function parse(input: buffer): Output
 	end
 
 	local result = { block = parse_block_node() }
+
+	-- after another issue, what's left is usually caused by that issue
+	if #issues == 0 and not current_is "eof" then expected_but "eof" end
 
 	if #issues > 0 then
 		error {

@@ -316,10 +316,27 @@ t.TEST("basic expression and command parsing", function()
 	)
 end)
 
+t.TEST("display", function()
+	t.CASE "string"
+	t.CHECK(display.display_expression(astgen.expr_string "meow") == '"meow"')
+
+	t.CASE "var"
+	t.CHECK(
+		display.display_var(astgen.var(astgen.varroot_global "meow", {}))
+			== "meow"
+	)
+end)
+
 t.TEST("ast fuzz testing", function()
 	local ast = generate(1000)
 
 	CASE_AST("fuzz", ast.block)
+end)
+
+t.TEST("line numbers", function()
+	t.CASE "statement on the third line"
+	local output = ast.parse(buffer.fromstring "meow\n\r\nmeow")
+	t.CHECK(output.result and output.result.block.body[2].span.z == 3)
 end)
 
 local function CASE_TREE(p: {
@@ -423,15 +440,34 @@ t.TEST("treewalker", function()
 	}
 
 	CASE_TREE {
+		name = "expression number underscores and bases",
+		input = "meow 1_000 0b101 0x1_F",
+		match = { 1000, 5, 31 },
+	}
+
+	CASE_TREE {
 		name = "expression evaluate",
 		input = "meow (1)",
 		match = { 1 },
 	}
 
 	CASE_TREE {
+		name = "expression binary error",
+		input = "meow (1 + {})",
+		match = {},
+		fails_with = "attempt to add on number and table at 6:12",
+	}
+
+	CASE_TREE {
 		name = "expression binary",
 		input = "meow (1 + 1)",
 		match = { 2 },
+	}
+
+	CASE_TREE {
+		name = "expression binary associativity",
+		input = "meow (10 - 2 - 3) (8 / 2 / 2) (1 == 1 == true) (2 ^ 3 ^ 2)",
+		match = { 5, 2, true, 512 },
 	}
 
 	CASE_TREE {
@@ -471,6 +507,12 @@ t.TEST("treewalker", function()
 	}
 
 	CASE_TREE {
+		name = "expression and/or short-circuit",
+		input = "meow (false and (&error oops)) (1 or (&error oops))",
+		match = { false, 1 },
+	}
+
+	CASE_TREE {
 		name = "expression command",
 		input = "meow (&ping 12)",
 		match = { "pong", 12 },
@@ -480,6 +522,12 @@ t.TEST("treewalker", function()
 		name = "expression table",
 		input = "meow { field = { meow = true }, true, [2] = false }\z",
 		match = { { field = { meow = true }, true, [2] = false } },
+	}
+
+	CASE_TREE {
+		name = "expression table vectors",
+		input = "meow { [1, 2, 3], [7] }",
+		match = { { vector.create(1, 2, 3), vector.create(7, 0, 0) } },
 	}
 
 	CASE_TREE {
@@ -547,10 +595,65 @@ t.TEST("treewalker", function()
 	}
 
 	CASE_TREE {
+		name = "lambda arguments",
+		input = "value = 1\n\z
+		var = |value| { }\n\z
+		$var 2\n\z
+		meow $value",
+		match = { 1 },
+	}
+
+	CASE_TREE {
+		name = "lambda recursion",
+		input = "fact = |n| { if ($n <= 1) { return 1 } else { return (&$fact ($n - 1)) * $n } }\n\z
+		meow (&$fact 5)",
+		match = { 120 },
+	}
+
+	CASE_TREE {
+		name = "lambda closures",
+		input = "make = |n| { return || { return $n } }\n\z
+		a = &$make 1\n\z
+		b = &$make 2\n\z
+		meow (&$a) (&$b)",
+		match = { 1, 2 },
+	}
+
+	CASE_TREE {
+		name = "return local",
+		input = "var = || { value = 5; return $value }\n\z
+		meow (&$var)",
+		match = { 5 },
+	}
+
+	CASE_TREE {
+		name = "early return",
+		input = "var = |value| { if ($value) { return 1 } return 2 }\n\z
+		meow (&$var true) (&$var false)",
+		match = { 1, 2 },
+	}
+
+	CASE_TREE {
 		name = "if statement",
 		input = "var = 1\n\z
 		if ($var == 1) { meow 2 }",
 		match = { 2 },
+	}
+
+	CASE_TREE {
+		name = "return value ending in ;",
+		input = "var = || { return 1, 2; }; meow (&$var)",
+		match = { 1, 2 },
+	}
+
+	CASE_TREE {
+		name = "return values over lines",
+		input = "var = || {\n\z
+			return 1 2,\n\z
+			3\n\z
+		}\n\z
+		meow (&$var)",
+		match = { 1, 2, 3 },
 	}
 
 	CASE_TREE {
@@ -627,11 +730,35 @@ if ($var == 1) {
 	}
 
 	CASE_TREE {
+		name = "for loop break in lambda",
+		input = "var = || { n = 0\n\z
+		for ({ 1, 2, 3 }) |key, value| { if ($value == 2) { break } n = $n + 1 }\n\z
+		return $n }\n\z
+		meow (&$var)",
+		match = { 1 },
+	}
+
+	CASE_TREE {
+		name = "for loop return",
+		input = "var = || { for ({ 1, 2, 3 }) |key, value| { return $value } }\n\z
+		meow (&$var)",
+		match = { 1 },
+	}
+
+	CASE_TREE {
 		name = "while loop",
 		input = "n = 0\n\z
 		while ($n < 10) { n = ($n + 1) }\n\z
 		meow $n",
 		match = { 10 },
+	}
+
+	CASE_TREE {
+		name = "false variable",
+		input = "var = false\n\z
+		if ($var == false) { var = true }\n\z
+		meow $var",
+		match = { true },
 	}
 
 	CASE_TREE {
@@ -642,11 +769,34 @@ if ($var == 1) {
 	}
 
 	CASE_TREE {
+		name = "string escapes",
+		input = [[meow "\\n" "\\t" "\\65" "\65\n" "\"\\"]],
+		match = { "\\n", "\\t", "\\65", "A\n", '"\\' },
+	}
+
+	CASE_TREE {
 		name = "error",
 		input = "oop value",
 		match = {},
 		fails_with = "attempt to invoke a non-existent command: oop",
 	}
+
+	CASE_TREE {
+		name = "error position",
+		input = "var = -{}",
+		match = {},
+		fails_with = "attempt to negate table at 6:9",
+	}
+end)
+
+t.TEST("unparsed input", function()
+	local function CASE_PARSE_FAILS(name: string, input: string)
+		t.CASE(name)
+		t.CHECK_EXPECT_ERR(ast.parse, buffer.fromstring(input))
+	end
+
+	CASE_PARSE_FAILS("stray delimiter", "meow 1 ) meow 2")
+	CASE_PARSE_FAILS("statement after return", "return 1\nmeow 2")
 end)
 
 --todo: write tests for analysis but im lazy

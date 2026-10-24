@@ -1,4 +1,5 @@
 local ast = require "./ast"
+local to_number = require "./ast/number"
 local treewalker = require "./treewalker"
 
 export type Metadata = {
@@ -179,28 +180,53 @@ local slash_characters: { [string]: string } = {
 	['"'] = '"',
 }
 --[=[
+Checks if a string token ends with its closing quote. The lexer lets an
+unfinished string through so it can be completed while being typed.
+]=]
+local function is_closed_string(text: string): boolean
+	if #text < 2 or string.sub(text, -1) ~= string.sub(text, 1, 1) then
+		return false
+	end
+
+	-- an odd number of backslashes escapes the quote
+	local backslashes = 0
+	for i = #text - 1, 2, -1 do
+		if string.sub(text, i, i) ~= "\\" then break end
+		backslashes += 1
+	end
+
+	return backslashes % 2 == 0
+end
+
+--[=[
 Converts tokens into a value
 ]=]
 local function get_value<T>(token: ast.Token<ast.TokenKind>): unknown
 	if token.kind == "number" then
-		local n = tonumber(token.text)
+		local n = to_number(token.text)
 		return n or null
 	elseif token.kind == "string" then
-		local text = string.sub(token.text, 2, -2)
-
-		text = string.gsub(
-			text,
-			"\\([0-9][0-9]?[0-9]?)",
-			function(value: string)
-				local code = tonumber(value)
-				if not code or code > 255 then return value end
-				return string.char(code)
-			end
+		local text = string.sub(
+			token.text,
+			2,
+			if is_closed_string(token.text) then -2 else -1
 		)
 
-		for key, value in slash_characters do
-			text = string.gsub(text, `\\{key}`, value)
-		end
+		-- one pass, so a backslash that comes out of `\\` can't start another
+		-- escape. the digits after the first one only belong to a `\ddd`.
+		text = string.gsub(text, "\\(.[0-9]?[0-9]?)", function(escape: string)
+			local first = string.sub(escape, 1, 1)
+			if string.match(first, "[0-9]") then
+				local code = tonumber(escape)
+				if not code or code > 255 then return escape end
+				return string.char(code)
+			end
+
+			local value = slash_characters[first]
+			return if value
+				then value .. string.sub(escape, 2)
+				else `\\{escape}`
+		end)
 
 		return text
 	elseif token.kind == "identifier" then
@@ -361,6 +387,15 @@ end
 
 function autocomplete.visit_var_root(state, node)
 	if span_cursor(state, node.span) ~= "within" then return end
+	-- a word in a table argument is completed from the table's type instead
+	if
+		node.kind == "global"
+		and state.result
+		and state.result.replace.x == node.span.x
+		and state.result.replace.y == node.span.y
+	then
+		return
+	end
 	local replace_span = node.span
 	local suggestions: { Suggestion } = {}
 
@@ -516,16 +551,70 @@ local function from_description_match_literal(
 	return nil
 end
 
-local function get_type_name(type: Type?)
+local function get_type_name(type: Type?): string
 	if not type then
 		return "unknown"
 	elseif type.kind == "literal" then
 		return `{type.value}`
 	elseif type.kind == "strange" then
 		return type.type
-	else
-		return type.kind
+	elseif type.kind == "command" then
+		return "Command"
+	elseif type.kind == "function" then
+		return "Function"
+	elseif type.kind == "intersection" then
+		local fields = {}
+
+		for _, field in type.fields do
+			table.insert(fields, get_type_name(field))
+		end
+
+		return table.concat(fields, " & ")
+	elseif type.kind == "union" then
+		local fields = {}
+		local optional = false
+
+		for _, field in type.fields do
+			local name = get_type_name(field)
+
+			if field.kind == "literal" and field.value == nil then
+				optional = true
+			elseif not table.find(fields, name) then
+				-- plurals are a union of two types with the same name
+				table.insert(fields, name)
+			end
+		end
+
+		local name = table.concat(fields, " | ")
+
+		return if not optional
+			then name
+			elseif #fields == 0 then "nil"
+			elseif string.find(name, " [|&] ") then `({name})?`
+			else `{name}?`
+	elseif type.kind == "table" then
+		local keys = {}
+
+		if type.fields then
+			for key, value in type.fields do
+				table.insert(
+					keys,
+					`{get_type_name(key)} = {get_type_name(value)}`
+				)
+			end
+		end
+
+		if type.indexer and type.value then
+			table.insert(
+				keys,
+				`[{get_type_name(type.indexer)}] = {get_type_name(type.value)}`
+			)
+		end
+
+		return `\{ {table.concat(keys, ", ")} \}`
 	end
+
+	return "unknown"
 end
 
 -- using an evaluated value, check if it matches the given type
@@ -565,7 +654,7 @@ local function match_eval_value(
 
 		for _, field in type.fields do
 			if match_eval_value(value, field, exact) then
-				table.insert(matching, type)
+				table.insert(matching, field)
 			end
 		end
 
@@ -740,6 +829,54 @@ local function fill_suggestions(
 		if not node then return end
 		if node.kind ~= "table" then return end
 
+		local suggestions = state.result.suggestions
+
+		local function fill_keys()
+			if not type.fields then return end
+
+			for key in type.fields do
+				local name = key.value
+
+				-- a number key can only be written as [n] =
+				if typeof(name) == "number" then
+					table.insert(suggestions, {
+						kind = "expression" :: "expression",
+						metadata = nil,
+						text = `[{name}] =`,
+						display = `[{name}]`,
+					})
+					continue
+				end
+
+				table.insert(suggestions, {
+					kind = "assign",
+					metadata = nil,
+					text = name,
+					display = name,
+				})
+			end
+		end
+
+		-- a bare word in a table is read as a variable, so strings have to be
+		-- quoted there
+		local function fill_value(
+			value: ast.Expression | ast.ExpressionCommand?,
+			value_type: Type
+		)
+			local from = #suggestions + 1
+			fill_suggestions(state, value, value_type)
+
+			for i = from, #suggestions do
+				local suggestion = suggestions[i]
+				if suggestion.kind ~= nil then continue end
+
+				local quoted = table.clone(suggestion) :: any
+				quoted.kind = "expression"
+				quoted.text = string.format("%q", suggestion.text)
+				suggestions[i] = quoted
+			end
+		end
+
 		local elements = node.values.value
 		local item_idx = 1 -- refers to item idx in node, not type
 		local total_nokeys = 0 -- amount of no keys that have been seen
@@ -755,19 +892,24 @@ local function fill_suggestions(
 				item_idx = idx
 				break
 			elseif span_cursor(state, item.span) == "after" then
-				item_idx = idx
+				-- past the separator is the next field
+				item_idx = if item.separator then idx + 1 else idx
 			end
 		end
 
 		local item = elements[item_idx]
 
-		-- no node that matched an index was found, so resort to a number key.
+		-- no node that matched an index was found, so a new field is being
+		-- written: suggest the keys, or the value for the next number key.
 		if not item then
+			state.result.replace = vector.create(state.cursor, state.cursor)
+			fill_keys()
+
 			-- +1 because we start from 0 and no matching elemenmt was found
 			local field = from_fields_matching_literal(type, total_nokeys + 1)
 
 			if field == nil or type.fields == nil then return end
-			fill_suggestions(state, item, type.fields[field])
+			fill_value(nil, type.fields[field])
 			return
 		end
 
@@ -829,19 +971,10 @@ local function fill_suggestions(
 				elseif element.kind == "nokey" then element.span
 				else state.result.replace
 
-			if type.fields then
-				for key in type.fields do
-					table.insert(state.result.suggestions, {
-						kind = "assign",
-						metadata = nil,
-						text = key.value,
-						display = key.value,
-					})
-				end
-			end
+			fill_keys()
 
 			if type.indexer then
-				fill_suggestions(state, keyexpression :: any, type.indexer)
+				fill_value(keyexpression :: any, type.indexer)
 			end
 		end
 
@@ -880,7 +1013,7 @@ local function fill_suggestions(
 				elseif element.kind == "nokey" then element.span
 				else state.result.replace
 
-			fill_suggestions(state, element.value, element_type)
+			fill_value(element.value, element_type)
 		end
 	elseif type.kind == "union" then
 		local possible_types = match(state, node, type)
@@ -911,7 +1044,8 @@ local function complete_function(
 	if not arg_type then return end
 
 	state.result = {
-		replace = arg_node.span,
+		replace = arg_node and arg_node.span
+			or vector.create(state.cursor, state.cursor, 0),
 		suggestions = {},
 		additional_info = {
 			name = arg_type,
@@ -1043,7 +1177,18 @@ local function choose_command(
 end
 
 function autocomplete.visit_command(state, node)
-	if span_cursor(state, node.span) ~= "within" then return end
+	local cursor_at = span_cursor(state, node.span)
+	if cursor_at == "before" then return end
+	-- the span stops at the last argument, but the next one is typed after it
+	if
+		cursor_at == "after"
+		and string.find(
+			string.sub(state.input, node.span.y + 1, state.cursor),
+			"[^ \t\r]"
+		)
+	then
+		return
+	end
 	if span_cursor(state, node.var.span) ~= "after" then return end
 	local root = node.var.root
 	if #node.var.suffixes > 0 then return end
@@ -1078,13 +1223,13 @@ function autocomplete.visit_stat_command_end(state, node)
 	if span_cursor(state, node.var.root.span) ~= "within" then return end
 
 	table.insert(state.result.suggestions, {
-		kind = nil,
+		kind = "expression" :: "expression",
 		metadata = nil,
 		text = "for",
 		display = "for",
 	})
 	table.insert(state.result.suggestions, {
-		kind = nil,
+		kind = "expression" :: "expression",
 		metadata = nil,
 		text = "while",
 		display = "while",

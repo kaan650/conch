@@ -27,6 +27,25 @@ local function deny(why: string): never
 	error(setmetatable({ why = why }, denied_mt), 0)
 end
 
+-- keyed by user, so the entries go away together with the user
+local last_runs: { [types.User]: { [string]: number } } = {}
+setmetatable(last_runs, { __mode = "k" })
+
+--[=[
+Returns how many seconds are left on the command's cooldown for the user.
+]=]
+local function get_cooldown(
+	who: types.User,
+	name: string,
+	cooldown: number?
+): number
+	local runs = last_runs[who]
+	local last = runs and runs[name]
+	if not cooldown or not last then return 0 end
+
+	return math.max(cooldown - (os.clock() - last), 0)
+end
+
 local console: types.Console = {
 	vm = vm,
 	commands = commands,
@@ -201,6 +220,15 @@ local function determine_cmd_type(type: language.Type, ...: unknown)
 				field.kind == "command",
 				`cannot determine overload with type {field.kind}`
 			)
+			local last_argument = field.arguments[#field.arguments]
+			local is_vararg = if last_argument
+				then last_argument.varargs
+				else false
+
+			if not is_vararg and #field.arguments < select("#", ...) then
+				continue
+			end
+
 			local bad = false
 
 			for j, argument in field.arguments do
@@ -223,12 +251,14 @@ local function determine_cmd_type(type: language.Type, ...: unknown)
 
 		if #options > 1 then
 			error(
-				`could not determine valid overload for {options[1].name}, consider separating the command or introducing a literal to differentiate by?`
+				`could not determine valid overload for {options[1].name}, consider separating the command or introducing a literal to differentiate by?`,
+				0
 			)
 		end
 		if #options == 0 then
 			error(
-				`could not determine valid overload for {type.fields[1].name}, no options matched`
+				`could not determine valid overload for {type.fields[1].name}, no options matched`,
+				0
 			)
 		end
 
@@ -238,6 +268,12 @@ local function determine_cmd_type(type: language.Type, ...: unknown)
 	end
 
 	error "no valid command; unreachable?"
+end
+
+local function display_value(value: unknown): string
+	return if typeof(value) == "string"
+		then string.format("%q", value)
+		else tostring(value)
 end
 
 --[=[
@@ -253,8 +289,18 @@ local function coerce_value_into_type(
 	elseif type.kind == "function" then
 		return value
 	elseif type.kind == "intersection" then
+		-- every part has to accept the value
+		for _, field in type.fields do
+			coerce_value_into_type(field, value)
+		end
 		return value
 	elseif type.kind == "literal" then
+		if value ~= type.value then
+			error(
+				`expected {display_value(type.value)}, got {display_value(value)}`,
+				0
+			)
+		end
 		return value
 	elseif type.kind == "strange" then
 		if type.convert then
@@ -263,35 +309,62 @@ local function coerce_value_into_type(
 			return value
 		end
 	elseif type.kind == "table" then
-		assert(
-			typeof(value) == "table",
-			`not a table, should match table type but got {typeof(value)}`
-		)
+		if typeof(value) ~= "table" then
+			error(
+				`not a table, should match table type but got {typeof(value)}`,
+				0
+			)
+		end
 		local clone = {}
+		local declared = {}
 
 		if type.fields then
 			for fieldkey, fieldvalue in type.fields do
 				if fieldkey.value == nil then continue end
 
 				local clone_value = rawget(value :: any, fieldkey.value)
+				declared[fieldkey.value] = true
 				clone[fieldkey.value] =
 					coerce_value_into_type(fieldvalue, clone_value)
 			end
 		end
 
-		if type.indexer and type.value then
-			for key, value in pairs(clone) do
-				if language.matches_type(key, type.indexer, true) then
-					clone[coerce_value_into_type(type.indexer, key)] =
-						coerce_value_into_type(type.value, value)
-				end
-			end
+		for key, field_value in pairs(value :: any) do
+			if declared[key] then continue end
+
+			local clone_key = if type.indexer
+				then coerce_value_into_type(type.indexer, key)
+				else key
+			clone[clone_key] = if type.value
+				then coerce_value_into_type(type.value, field_value)
+				else field_value
 		end
+
+		return clone
 	elseif type.kind == "union" then
 		for _, field in type.fields do
 			if not language.matches_type(value, field, true) then continue end
 			return coerce_value_into_type(field, value)
 		end
+
+		-- matching only looks at the luau type, so "5" still converts to a number
+		local reason
+		local names: { string } = {}
+		for _, field in type.fields do
+			local ok, result = pcall(coerce_value_into_type, field, value)
+			if ok then return result end
+
+			-- the error of a member the value looks like explains it best
+			if reason == nil and language.matches_type(value, field) then
+				reason = result
+			end
+			table.insert(names, arguments.obtain_type_name(field))
+		end
+
+		if reason then error(reason, 0) end
+
+		local expected = table.concat(names, " | ")
+		error(`could not convert {display_value(value)} into {expected}`, 0)
 	end
 	return value
 end
@@ -483,6 +556,20 @@ local function register_command<T...>(
 				if why then deny(why) end
 			end
 
+			-- the cooldown starts only once the callback runs, and is checked
+			-- again since converting the arguments can yield
+			if IS_SERVER and context and info.cooldown then
+				local remaining =
+					get_cooldown(context.executor, name, info.cooldown)
+				if remaining > 0 then
+					deny(`{name} is on cooldown for {math.ceil(remaining)}s`)
+				end
+
+				local runs = last_runs[context.executor] or {}
+				last_runs[context.executor] = runs
+				runs[name] = os.clock()
+			end
+
 			local results =
 				{ pcall(callback, unpack(custom, 1, select("#", ...))) }
 			local ok = table.remove(results, 1)
@@ -505,9 +592,24 @@ local function register_command<T...>(
 	}
 
 	if IS_SERVER then
+		local previous = commands[name]
+
 		for _, player in Players:GetPlayers() do
 			-- print("replicating to player", player)
 			replicate_to_player(player, representation)
+
+			-- a client that lost access would keep the previous registration
+			local player_user = state.users[user.obtain_user_key(player)]
+			if
+				previous
+				and player_user
+				and not user.has_permissions(
+					player_user,
+					unpack(info.permissions)
+				)
+			then
+				net.server.fire_unregister_command_to(player, { name = name })
+			end
 		end
 		commands[name] = representation
 	end
@@ -608,6 +710,7 @@ return {
 	after_command_run = after_run,
 	before_run = before_run,
 	get_denied_reason = get_denied_reason,
+	get_cooldown = get_cooldown,
 
 	set_command_from_representation = set_command_from_representation,
 	unset_command_from_representation = unregister_command,

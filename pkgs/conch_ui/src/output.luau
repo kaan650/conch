@@ -128,11 +128,11 @@ local function write(self: Stream, input: buffer)
 
 	local function consume()
 		i += 1
-		return if i - 1 > len_input then 0 else buffer.readu8(input, i - 1)
+		return if i - 1 >= len_input then 0 else buffer.readu8(input, i - 1)
 	end
 
 	local function peek()
-		return if i > len_input then 0 else buffer.readu8(input, i)
+		return if i >= len_input then 0 else buffer.readu8(input, i)
 	end
 
 	local function is_escapecode_stop()
@@ -202,16 +202,27 @@ local function write(self: Stream, input: buffer)
 	end
 
 	local function reset_tag(kind: index<Tag, "kind">)
+		local first = nil
+
+		for i, tag in self.active_tags do
+			if kind == tag.kind then
+				first = i
+				break
+			end
+		end
+
+		if not first then return end
+
+		-- tags close in reverse order, so the ones opened after it are closed
+		-- too and opened again
 		local insert_back = {}
 
-		for _, tag in self.active_tags do
+		for i = #self.active_tags, first, -1 do
+			local tag = self.active_tags[i]
 			pop_tag(tag)
+			table.remove(self.active_tags, i)
 
-			if kind == tag.kind then
-				break
-			else
-				table.insert(insert_back, tag)
-			end
+			if kind ~= tag.kind then table.insert(insert_back, tag) end
 		end
 
 		for i = #insert_back, 1, -1 do
@@ -585,10 +596,12 @@ local function view_from(self: Stream, line_from: number)
 	buffer.copy(b, at, self.richtext, top_column, delta)
 	at += delta
 
-	for i = #self.active_tags, 1, -1 do
-		local active = self.active_tags[i]
-		if active.line > bottom_column then break end
-		pop_tag(active)
+	-- the tags still open where the window ends, not where the stream ends
+	local bottom_tags = self.start_tags_per_line[line_from + 1]
+		or self.active_tags
+
+	for i = #bottom_tags, 1, -1 do
+		pop_tag(bottom_tags[i])
 	end
 
 	return buffer.readstring(b, 0, at)

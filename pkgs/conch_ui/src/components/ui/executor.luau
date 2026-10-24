@@ -28,6 +28,9 @@ local AUTO_SCROLL_DELAY = 0.4
 local AUTO_SCROLL_INTERVAL = 0.05
 
 local history_n = 0
+-- the line typed before browsing, kept out of state.history because
+-- get_history and on_history_changed hand that table out
+local draft = ""
 
 return component(function(p: {
 	working: () -> boolean,
@@ -115,17 +118,21 @@ return component(function(p: {
 		return before .. with .. " " .. after
 	end
 
+	-- a line recalled from history keeps the arrows on the history even when
+	-- it has suggestions, until it's edited
+	local function browsing_history(): boolean
+		if raw_text():find "\n" then return false end
+		if #p.filtered_suggestions() == 0 then return true end
+		return history_n ~= 0 and raw_text() == state.history[history_n]
+	end
+
 	local function move_down()
 		local history = state.history
-		local analysis_result = p.analysis()
-		if
-			#analysis_result.suggestions == 0
-			and raw_text():find "\n" == nil
-		then
-			if history_n == 0 then history[history_n] = raw_text() end
+		if browsing_history() then
+			if history_n == 0 then draft = raw_text() end
 
 			history_n = math.clamp(history_n - 1, 0, #history)
-			raw_text(history[history_n] or "")
+			raw_text(if history_n == 0 then draft else history[history_n] or "")
 			cursor_position(#raw_text() + 1)
 		else
 			selected_suggestion(
@@ -136,15 +143,11 @@ return component(function(p: {
 
 	local function move_up()
 		local history = state.history
-		local analysis_result = p.analysis()
-		if
-			#analysis_result.suggestions == 0
-			and raw_text():find "\n" == nil
-		then
-			if history_n == 0 then history[history_n] = raw_text() end
+		if browsing_history() then
+			if history_n == 0 then draft = raw_text() end
 
 			history_n = math.clamp(history_n + 1, 0, #history)
-			raw_text(history[history_n] or "")
+			raw_text(if history_n == 0 then draft else history[history_n] or "")
 			cursor_position(#raw_text() + 1)
 		else
 			selected_suggestion(math.max(1, selected_suggestion() - 1))

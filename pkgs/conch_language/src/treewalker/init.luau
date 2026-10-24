@@ -1,5 +1,6 @@
 local ast = require "./ast"
 local display = require "./ast/display"
+local to_number = require "./ast/number"
 
 type Node = {
 	read span: vector,
@@ -30,7 +31,7 @@ export type ExecutionState = {
 	globals: { [string]: unknown },
 	trace: { Trace },
 	scope: Scope,
-	last_statement: { scope: Scope, node: ast.LastStatement }?,
+	last_statement: { node: ast.LastStatement, values: { unknown } }?,
 }
 
 type Expression = ast.Expression | ast.ExpressionCommand
@@ -59,6 +60,9 @@ Obtains a stack trace for the called function, which can be used to help
 fix errors with commands
 ]=]
 local function get_stack_trace_info(trace: Trace)
+	-- debug.info would read a stack level from a number
+	if type(trace.fn) ~= "function" then return `` end
+
 	local fn_name = trace.fn_name
 
 	if not fn_name and trace.fn then
@@ -102,6 +106,7 @@ local function pop_trace(state: ExecutionState) table.remove(state.trace) end
 
 local function reset_state(state: ExecutionState)
 	table.clear(state.trace)
+	state.last_statement = nil
 
 	while not state.scope.root do
 		state.scope = state.scope.up
@@ -139,7 +144,7 @@ local function read_variable(
 
 	while active do
 		local value = active.vars[var]
-		if value then return active, value end
+		if value ~= nil then return active, value end
 		active = active.up
 	end
 
@@ -176,7 +181,11 @@ local function call(state: ExecutionState, node: Node, fn: any, ...: any)
 			if name == true then nil else name,
 			node.span.z
 		)
+		local thread = coroutine.running()
+		local calling_machine = using_machine[thread]
+		using_machine[thread] = state
 		local result = table.pack(fn(...))
+		using_machine[thread] = calling_machine
 		pop_trace(state)
 		return result
 	end
@@ -213,27 +222,29 @@ local function get_value<T>(
 	token: ast.Token<ast.TokenKind>
 ): unknown
 	if token.kind == "number" then
-		local n = tonumber(token.text)
+		local n = to_number(token.text)
 		if not n then
-			return throw(state, token, `{n} is not a valid number`)
+			return throw(state, token, `{token.text} is not a valid number`)
 		end
 		return n
 	elseif token.kind == "string" then
 		local text = string.sub(token.text, 2, -2)
 
-		text = string.gsub(
-			text,
-			"\\([0-9][0-9]?[0-9]?)",
-			function(value: string)
-				local code = tonumber(value)
+		-- one pass, so a backslash that comes out of `\\` can't start another
+		-- escape. the digits after the first one only belong to a `\ddd`.
+		text = string.gsub(text, "\\(.[0-9]?[0-9]?)", function(escape: string)
+			local first = string.sub(escape, 1, 1)
+			if string.match(first, "[0-9]") then
+				local code = tonumber(escape)
 				assert(code)
 				return string.char(code)
 			end
-		)
 
-		for key, value in slash_characters do
-			text = string.gsub(text, `\\{key}`, value)
-		end
+			local value = slash_characters[first]
+			return if value
+				then value .. string.sub(escape, 2)
+				else `\\{escape}`
+		end)
 
 		return text
 	elseif token.kind == "identifier" then
@@ -319,7 +330,11 @@ local function evaluate_command(
 		)
 	end
 
-	return call(state, node, command, unpack(arguments, 1, n))
+	local result = call(state, node, command, unpack(arguments, 1, n))
+	-- how a lambda ended only matters to a for loop running it as its body
+	state.last_statement = nil
+
+	return result
 end
 
 local function evaluate_table(
@@ -338,6 +353,10 @@ local function evaluate_table(
 			if not token.value then return throw(state, field, "no value") end
 			local key = evaluate_expression(state, token.key.value)
 			local value = evaluate_expression(state, token.value)
+
+			if key == nil or key ~= key then
+				return throw(state, field, `table index is {key}`)
+			end
 
 			t[key] = value
 		elseif token.kind == "name_key" then
@@ -386,8 +405,12 @@ local function evaluate_binary(
 		return throw(state, node, "missing rhs expression")
 	end
 	local left: any = evaluate_expression(state, node.left)
-	local right: any = evaluate_expression(state, node.right)
 	local operator = node.operator.kind
+
+	if operator == "and" and not left then return left end
+	if operator == "or" and left then return left end
+
+	local right: any = evaluate_expression(state, node.right)
 
 	if operator == "!=" then
 		return wrap_op(
@@ -543,7 +566,12 @@ local function evaluate_unary(
 	if node.operator.kind == "!" then
 		return not value
 	elseif node.operator.kind == "-" then
-		return -value
+		local ok, result = pcall(function() return -value end)
+
+		if not ok then
+			return throw(state, node, `attempt to negate {typeof(value)}`)
+		end
+		return result
 	else
 		return throw(state, node, `unsupported operator {node.operator}`)
 	end
@@ -553,16 +581,12 @@ local function evaluate_lambda(
 	state: ExecutionState,
 	node: ast.ExpressionLambda
 )
-	local original_scope = {
-		vars = state.scope.vars,
-		root = true,
-		up = state.scope.up,
-	}
+	local original_scope = state.scope
 
 	local function conch_guest_fn(...: any): ...unknown
 		local scope: Scope = {
-			vars = original_scope.vars,
-			up = original_scope.up,
+			vars = {},
+			up = original_scope,
 			root = true :: true,
 		}
 
@@ -584,26 +608,13 @@ local function evaluate_lambda(
 
 		visit_block(state, node.body.block.value)
 
-		if state.last_statement then
-			local lstat = state.last_statement.node
+		local lstat = state.last_statement
 
-			if lstat.kind ~= "return" then
-				if calling_machine then
-					calling_machine.last_statement =
-						{ scope = scope, node = lstat }
-				end
-				return
-			end
+		if lstat then
+			if calling_machine then calling_machine.last_statement = lstat end
+			if lstat.node.kind ~= "return" then return end
 
-			local values = {}
-
-			for idx, value in lstat.values do
-				local node = value.value
-				if not node then continue end
-				values[idx] = evaluate_expression(state, node)
-			end
-
-			return unpack(values, 1, #lstat.values)
+			return unpack(lstat.values, 1, #lstat.node.values)
 		end
 
 		return
@@ -653,11 +664,17 @@ function evaluate_expression(
 		local y = contents[2] and contents[2].value
 		local z = contents[3] and contents[3].value
 
-		return vector.create(
+		local ok, result = pcall(
+			vector.create,
 			if x then evaluate_expression(state, x) :: number else 0,
 			if y then evaluate_expression(state, y) :: number else 0,
 			if z then evaluate_expression(state, z) :: number else 0
 		)
+
+		if not ok then
+			return throw(state, node, "vector components must be numbers")
+		end
+		return result
 	else
 		return throw(state, node, `could not evaluate {node.kind}`)
 	end
@@ -675,6 +692,11 @@ local function visit_stat_for(state: ExecutionState, node: ast.For): unknown
 
 	if not value_node then return throw(state, node, "missing expression") end
 	local value: any = evaluate_expression(state, value_node)
+	local kind = type(value)
+
+	if kind ~= "table" and kind ~= "function" and kind ~= "userdata" then
+		return throw(state, node, `attempt to iterate over {typeof(value)}`)
+	end
 
 	if not body_node then return throw(state, node, "missing body") end
 	local body = evaluate_expression(state, body_node)
@@ -767,7 +789,16 @@ local function visit_stat_if(state: ExecutionState, node: ast.If)
 end
 
 local function visit_lstat(state: ExecutionState, node: ast.LastStatement)
-	state.last_statement = { node = node, scope = state.scope }
+	local values = {}
+
+	if node.kind == "return" then
+		for idx, value in node.values do
+			if not value.value then continue end
+			values[idx] = evaluate_expression(state, value.value)
+		end
+	end
+
+	state.last_statement = { node = node, values = values }
 end
 
 local results = {}
@@ -799,7 +830,9 @@ function visit_block(state: ExecutionState, node: ast.Block, inherit: boolean?)
 		if state.last_statement then break end
 	end
 
-	if node.last_statement then visit_lstat(state, node.last_statement) end
+	if node.last_statement and not state.last_statement then
+		visit_lstat(state, node.last_statement)
+	end
 
 	if not state.scope.up then return result end
 	state.scope = state.scope.up
@@ -844,19 +877,7 @@ local function execute(state: ExecutionState, ast: ast.Ast): ExecutionResult
 	if not lstat then return result_ok end
 	if lstat.node.kind ~= "return" then return result_ok end
 
-	result_ok.values = table.create(#lstat.node.values, nil :: unknown)
-	assert(result_ok.values)
-
-	for idx, value in lstat.node.values do
-		if not value.value then continue end
-
-		ok, err = pcall(evaluate_expression, state, value.value)
-		if not ok then
-			reset_state(state)
-			return { ok = false, err = err:gsub(PATTERN_REMOVE_TRACE, "") }
-		end
-		result_ok.values[idx] = err
-	end
+	result_ok.values = lstat.values
 
 	return result_ok
 end
@@ -865,9 +886,14 @@ return {
 	create_state = create_state,
 
 	execute = function(state: ExecutionState, ast: ast.Ast)
-		using_machine[coroutine.running()] = state
+		local thread = coroutine.running()
+		local outer = using_machine[thread]
+		-- a cancelled run never got to clean up after itself
+		if not outer then reset_state(state) end
+
+		using_machine[thread] = state
 		local result = execute(state, ast)
-		using_machine[coroutine.running()] = nil
+		using_machine[thread] = outer
 		return result
 	end,
 }
